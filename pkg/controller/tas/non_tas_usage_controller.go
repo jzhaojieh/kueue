@@ -37,11 +37,13 @@ import (
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 )
 
-func newNonTasUsageReconciler(k8sClient client.Client, cache *schdcache.Cache, roleTracker *roletracker.RoleTracker) *NonTasUsageReconciler {
+func newNonTasUsageReconciler(k8sClient client.Client, cache *schdcache.Cache, roleTracker *roletracker.RoleTracker, priorityThreshold *int32) *NonTasUsageReconciler {
 	return &NonTasUsageReconciler{
 		k8sClient:   k8sClient,
 		cache:       cache,
 		roleTracker: roleTracker,
+
+		priorityThreshold: priorityThreshold,
 	}
 }
 
@@ -51,6 +53,8 @@ type NonTasUsageReconciler struct {
 	k8sClient   client.Client
 	cache       *schdcache.Cache
 	roleTracker *roletracker.RoleTracker
+
+	priorityThreshold *int32
 }
 
 var _ reconcile.Reconciler = (*NonTasUsageReconciler)(nil)
@@ -72,7 +76,7 @@ func (r *NonTasUsageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	if belongsToNonTASCache(&pod) {
+	if r.filterPod(&pod) {
 		r.cache.TASCache().Update(&pod, log)
 	} else {
 		r.cache.TASCache().DeletePodByKey(req.NamespacedName)
@@ -80,10 +84,7 @@ func (r *NonTasUsageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-func belongsToNonTASCache(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
+func (r *NonTasUsageReconciler) filterPod(pod *corev1.Pod) bool {
 	if utiltas.IsTAS(pod) {
 		return false
 	}
@@ -94,23 +95,22 @@ func belongsToNonTASCache(pod *corev1.Pod) bool {
 	if utilpod.IsTerminated(pod) {
 		return false
 	}
+	if r.priorityThreshold != nil && pod.Spec.Priority != nil && *pod.Spec.Priority < *r.priorityThreshold {
+		return false
+	}
 	return true
 }
 
 func (r *NonTasUsageReconciler) Create(e event.TypedCreateEvent[*corev1.Pod]) bool {
-	return belongsToNonTASCache(e.Object)
-}
-
-func shouldReconcilePodUpdate(oldPod, newPod *corev1.Pod) bool {
-	return belongsToNonTASCache(oldPod) != belongsToNonTASCache(newPod)
+	return r.filterPod(e.Object)
 }
 
 func (r *NonTasUsageReconciler) Update(e event.TypedUpdateEvent[*corev1.Pod]) bool {
-	return shouldReconcilePodUpdate(e.ObjectOld, e.ObjectNew)
+	return r.filterPod(e.ObjectOld) != r.filterPod(e.ObjectNew)
 }
 
 func (r *NonTasUsageReconciler) Delete(e event.TypedDeleteEvent[*corev1.Pod]) bool {
-	return belongsToNonTASCache(e.Object)
+	return true
 }
 
 func (r *NonTasUsageReconciler) Generic(event.TypedGenericEvent[*corev1.Pod]) bool {
