@@ -103,6 +103,14 @@ func WithResourceMetrics(enabled bool) Option {
 	}
 }
 
+// WithTASPriorityThreshold sets the priority threshold for non-TAS pods.
+// Pods with priority lower than this threshold are excluded from TAS capacity accounting.
+func WithTASPriorityThreshold(threshold *int32) Option {
+	return func(c *Cache) {
+		c.tasPriorityThreshold = threshold
+	}
+}
+
 // WithRoleTracker sets the roleTracker for HA metrics.
 func WithRoleTracker(tracker *roletracker.RoleTracker) Option {
 	return func(c *Cache) {
@@ -142,7 +150,8 @@ type Cache struct {
 
 	hm hierarchy.Manager[*clusterQueue, *cohort]
 
-	tasCache tasCache
+	tasCache             tasCache
+	tasPriorityThreshold *int32
 
 	roleTracker  *roletracker.RoleTracker
 	customLabels *metrics.CustomLabels
@@ -156,11 +165,11 @@ func New(client client.Client, options ...Option) *Cache {
 		admissionChecks:        make(map[kueue.AdmissionCheckReference]AdmissionCheck),
 		workloadAssignedQueues: make(map[workload.Reference]kueue.ClusterQueueReference),
 		hm:                     hierarchy.NewManager(newCohort),
-		tasCache:               NewTASCache(client),
 	}
 	for _, option := range options {
 		option(cache)
 	}
+	cache.tasCache = NewTASCache(client, cache.tasPriorityThreshold)
 	cache.podsReadyCond.L = &cache.RWMutex
 	return cache
 }
