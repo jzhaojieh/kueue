@@ -380,6 +380,9 @@ objectRetentionPolicies:
 		cmpopts.IgnoreUnexported(net.ListenConfig{}),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger"),
 		cmpopts.IgnoreFields(webhook.Options{}, "TLSOpts"),
+		// DefaultTransform is a function and cannot be compared with cmp.Diff;
+		// it is tested separately in TestAddCacheByObjectToSetsDefaultTransform.
+		cmpopts.IgnoreFields(ctrlcache.Options{}, "DefaultTransform"),
 	}
 
 	// Ignore the controller manager section since it's side effect is checked against
@@ -1396,4 +1399,148 @@ func TestConfigureClusterProfileCache(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAddCacheByObjectToSetsDefaultTransform(t *testing.T) {
+	testCases := map[string]struct {
+		namespace      *string
+		wantTransform  bool
+		wantByObject   bool
+	}{
+		"valid namespace sets DefaultTransform and ByObject": {
+			namespace:     ptr.To(configapi.DefaultNamespace),
+			wantTransform: true,
+			wantByObject:  true,
+		},
+		"nil namespace is noop": {
+			namespace:     nil,
+			wantTransform: false,
+			wantByObject:  false,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			o := &ctrl.Options{}
+			cfg := &configapi.Configuration{
+				Namespace: tc.namespace,
+			}
+
+			addCacheByObjectTo(o, cfg)
+
+			if tc.wantTransform {
+				if o.Cache.DefaultTransform == nil {
+					t.Error("Expected DefaultTransform to be set, got nil")
+				}
+			} else {
+				if o.Cache.DefaultTransform != nil {
+					t.Error("Expected DefaultTransform to be nil")
+				}
+			}
+
+			if tc.wantByObject {
+				if o.Cache.ByObject == nil {
+					t.Error("Expected ByObject to be set, got nil")
+				}
+			} else {
+				if o.Cache.ByObject != nil {
+					t.Error("Expected ByObject to be nil")
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultTransformStripsManagedFields(t *testing.T) {
+	o := &ctrl.Options{}
+	cfg := &configapi.Configuration{
+		Namespace: ptr.To(configapi.DefaultNamespace),
+	}
+	addCacheByObjectTo(o, cfg)
+
+	if o.Cache.DefaultTransform == nil {
+		t.Fatal("DefaultTransform is nil, cannot test transform behavior")
+	}
+
+	t.Run("strips managedFields and preserves object data", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pod",
+				Namespace: "default",
+				Labels: map[string]string{
+					"app": "test",
+				},
+				Annotations: map[string]string{
+					"note": "keep-me",
+				},
+				ManagedFields: []metav1.ManagedFieldsEntry{
+					{
+						Manager:   "kubectl",
+						Operation: metav1.ManagedFieldsOperationApply,
+					},
+					{
+						Manager:   "kube-controller-manager",
+						Operation: metav1.ManagedFieldsOperationUpdate,
+					},
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "node-1",
+			},
+		}
+
+		result, err := o.Cache.DefaultTransform(pod)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		got, ok := result.(*corev1.Pod)
+		if !ok {
+			t.Fatal("DefaultTransform returned unexpected type")
+		}
+
+		if len(got.ManagedFields) != 0 {
+			t.Errorf("managedFields not stripped: got %d entries", len(got.ManagedFields))
+		}
+		if got.Name != "test-pod" {
+			t.Errorf("Name not preserved: got %q", got.Name)
+		}
+		if got.Namespace != "default" {
+			t.Errorf("Namespace not preserved: got %q", got.Namespace)
+		}
+		if got.Labels["app"] != "test" {
+			t.Errorf("Labels not preserved: got %v", got.Labels)
+		}
+		if got.Annotations["note"] != "keep-me" {
+			t.Errorf("Annotations not preserved: got %v", got.Annotations)
+		}
+		if got.Spec.NodeName != "node-1" {
+			t.Errorf("Spec.NodeName not preserved: got %q", got.Spec.NodeName)
+		}
+	})
+
+	t.Run("no-op when managedFields already nil", func(t *testing.T) {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-node",
+			},
+		}
+
+		result, err := o.Cache.DefaultTransform(node)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		got, ok := result.(*corev1.Node)
+		if !ok {
+			t.Fatal("DefaultTransform returned unexpected type")
+		}
+
+		if len(got.ManagedFields) != 0 {
+			t.Errorf("managedFields should remain empty, got %d entries", len(got.ManagedFields))
+		}
+		if got.Name != "test-node" {
+			t.Errorf("Name not preserved: got %q", got.Name)
+		}
+	})
 }
