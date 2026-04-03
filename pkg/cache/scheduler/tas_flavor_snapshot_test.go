@@ -17,6 +17,7 @@ limitations under the License.
 package scheduler
 
 import (
+	"math"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -439,9 +440,10 @@ func TestSortedDomainsWithLeader(t *testing.T) {
 	levels := []string{"block"}
 
 	testCases := map[string]struct {
-		domains       []*domain
-		unconstrained bool
-		wantOrder     []string
+		domains              []*domain
+		unconstrained        bool
+		preferPartialDomains bool
+		wantOrder            []string
 	}{
 		"leaderState descending: domains that can host leader come first": {
 			domains: []*domain{
@@ -496,6 +498,35 @@ func TestSortedDomainsWithLeader(t *testing.T) {
 			unconstrained: false,
 			wantOrder:     []string{"a", "b", "c"},
 		},
+		"LFC: minNonZeroChildState ascending after leaderState": {
+			domains: []*domain{
+				{id: "tight-child", leaderState: 1, minNonZeroChildState: 1, sliceStateWithLeader: 10, stateWithLeader: 20, levelValues: []string{"a"}},
+				{id: "loose-child", leaderState: 1, minNonZeroChildState: 5, sliceStateWithLeader: 8, stateWithLeader: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: true,
+			wantOrder:            []string{"tight-child", "loose-child"},
+		},
+		"LFC: minNonZeroChildState ignored when preferPartialDomains is false": {
+			domains: []*domain{
+				{id: "tight-child", leaderState: 1, minNonZeroChildState: 1, sliceStateWithLeader: 10, stateWithLeader: 20, levelValues: []string{"a"}},
+				{id: "loose-child", leaderState: 1, minNonZeroChildState: 5, sliceStateWithLeader: 8, stateWithLeader: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: false,
+			// Without preferPartialDomains, LFC sorts sliceStateWithLeader ascending: 8 < 10
+			wantOrder: []string{"loose-child", "tight-child"},
+		},
+		"BestFit: minNonZeroChildState ignored": {
+			domains: []*domain{
+				{id: "tight-child", leaderState: 1, minNonZeroChildState: 1, sliceStateWithLeader: 5, stateWithLeader: 20, levelValues: []string{"a"}},
+				{id: "loose-child", leaderState: 1, minNonZeroChildState: 10, sliceStateWithLeader: 10, stateWithLeader: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        false,
+			preferPartialDomains: true,
+			// BestFit sorts sliceStateWithLeader descending: 10 > 5
+			wantOrder: []string{"loose-child", "tight-child"},
+		},
 	}
 
 	for name, tc := range testCases {
@@ -503,7 +534,99 @@ func TestSortedDomainsWithLeader(t *testing.T) {
 			_, log := utiltesting.ContextWithLog(t)
 			s := newTASFlavorSnapshot(log, "test", levels, nil)
 
-			sorted := s.sortedDomainsWithLeader(tc.domains, tc.unconstrained)
+			sorted := s.sortedDomainsWithLeader(tc.domains, tc.unconstrained, tc.preferPartialDomains)
+
+			gotOrder := make([]string, len(sorted))
+			for i, d := range sorted {
+				gotOrder[i] = string(d.id)
+			}
+
+			if diff := cmp.Diff(tc.wantOrder, gotOrder); diff != "" {
+				t.Errorf("unexpected domain order (-want,+got): %s", diff)
+			}
+		})
+	}
+}
+
+// TestSortedDomains verifies the sorting criteria for sortedDomains (worker-only sorting):
+// BestFit: sliceState (descending), state (ascending), levelValues (ascending)
+// LFC: minNonZeroChildState (ascending), sliceState (ascending), state (ascending), levelValues (ascending)
+func TestSortedDomains(t *testing.T) {
+	levels := []string{"block"}
+
+	testCases := map[string]struct {
+		domains              []*domain
+		unconstrained        bool
+		preferPartialDomains bool
+		wantOrder            []string
+	}{
+		"BestFit: sliceState descending": {
+			domains: []*domain{
+				{id: "a", sliceState: 2, state: 10, levelValues: []string{"a"}},
+				{id: "b", sliceState: 5, state: 10, levelValues: []string{"b"}},
+				{id: "c", sliceState: 3, state: 10, levelValues: []string{"c"}},
+			},
+			unconstrained: false,
+			wantOrder:     []string{"b", "c", "a"},
+		},
+		"BestFit: minNonZeroChildState ignored even with preferPartialDomains": {
+			domains: []*domain{
+				{id: "tight-child", minNonZeroChildState: 1, sliceState: 5, state: 20, levelValues: []string{"a"}},
+				{id: "loose-child", minNonZeroChildState: 10, sliceState: 10, state: 20, levelValues: []string{"b"}},
+			},
+			unconstrained:        false,
+			preferPartialDomains: true,
+			// BestFit sorts sliceState descending: 10 > 5
+			wantOrder: []string{"loose-child", "tight-child"},
+		},
+		"LFC: minNonZeroChildState ascending with preferPartialDomains": {
+			domains: []*domain{
+				{id: "tight-child", minNonZeroChildState: 1, sliceState: 10, state: 20, levelValues: []string{"a"}},
+				{id: "loose-child", minNonZeroChildState: 5, sliceState: 8, state: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: true,
+			// LFC sorts minNonZeroChildState ascending: 1 < 5
+			wantOrder: []string{"tight-child", "loose-child"},
+		},
+		"LFC: minNonZeroChildState ignored without preferPartialDomains": {
+			domains: []*domain{
+				{id: "tight-child", minNonZeroChildState: 1, sliceState: 10, state: 20, levelValues: []string{"a"}},
+				{id: "loose-child", minNonZeroChildState: 5, sliceState: 8, state: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: false,
+			// Without preferPartialDomains, LFC sorts sliceState ascending: 8 < 10
+			wantOrder: []string{"loose-child", "tight-child"},
+		},
+		"LFC: minNonZeroChildState tiebreak falls back to sliceState": {
+			domains: []*domain{
+				{id: "more-slices", minNonZeroChildState: 3, sliceState: 10, state: 20, levelValues: []string{"a"}},
+				{id: "fewer-slices", minNonZeroChildState: 3, sliceState: 5, state: 10, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: true,
+			// Equal minNonZeroChildState → LFC sliceState ascending: 5 < 10
+			wantOrder: []string{"fewer-slices", "more-slices"},
+		},
+		"LFC: all-zero children use MaxInt32 and sort last": {
+			domains: []*domain{
+				{id: "all-full", minNonZeroChildState: math.MaxInt32, sliceState: 5, state: 10, levelValues: []string{"a"}},
+				{id: "has-partial", minNonZeroChildState: 2, sliceState: 8, state: 16, levelValues: []string{"b"}},
+			},
+			unconstrained:        true,
+			preferPartialDomains: true,
+			// MaxInt32 > 2, so has-partial sorts first
+			wantOrder: []string{"has-partial", "all-full"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			_, log := utiltesting.ContextWithLog(t)
+			s := newTASFlavorSnapshot(log, "test", levels, nil)
+
+			sorted := s.sortedDomains(tc.domains, tc.unconstrained, tc.preferPartialDomains)
 
 			gotOrder := make([]string, len(sorted))
 			for i, d := range sorted {
