@@ -6345,7 +6345,7 @@ func TestFindTopologyAssignmentsMultiLayerReplacement(t *testing.T) {
 			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
 			c := clientBuilder.Build()
 
-			tasCache := NewTASCache(c)
+			tasCache := NewTASCache(c, nil)
 			for i := range tc.nodes {
 				tasCache.SyncNode(&tc.nodes[i])
 			}
