@@ -102,8 +102,8 @@ func TestFilterPodPriorityThreshold(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "pod1",
 					Namespace: "ns",
-					Labels: map[string]string{
-						kueue.TASLabel: "true",
+					Annotations: map[string]string{
+						kueue.PodSetPreferredTopologyAnnotation: "block",
 					},
 				},
 				Spec: corev1.PodSpec{
