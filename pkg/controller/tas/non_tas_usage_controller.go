@@ -67,7 +67,7 @@ func (r *NonTasUsageReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 		log.V(5).Info("Idempotently deleting not found pod")
-		r.cache.TASCache().DeletePodByKey(req.NamespacedName)
+		r.cache.TASCache().DeletePodByKey(req.NamespacedName, log)
 		return ctrl.Result{}, nil
 	}
 
