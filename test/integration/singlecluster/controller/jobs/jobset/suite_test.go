@@ -22,6 +22,7 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -111,6 +112,10 @@ func managerAndSchedulerSetup(setupTASControllers bool, opts ...jobframework.Opt
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "controller", failedCtrl)
 
 		err = indexer.Setup(ctx, mgr.GetFieldIndexer())
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		// Register batchv1.Job OwnerReferenceUID index for deleteStaleGangChildJobs
+		err = mgr.GetFieldIndexer().IndexField(ctx, &batchv1.Job{}, indexer.OwnerReferenceUID, indexer.IndexOwnerUID)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		if setupTASControllers {
