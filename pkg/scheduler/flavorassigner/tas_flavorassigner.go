@@ -45,6 +45,11 @@ func (a *Assignment) WorkloadsTopologyRequests(wl *workload.Info, cq *schdcache.
 				// There is no resource quota assignment for the PodSet - no need to check TAS.
 				continue
 			}
+			if psAssignment.Count == 0 {
+				// Skip podSets with count=0 (fully reclaimable/completed).
+				// No TAS assignment is needed for 0 pods.
+				continue
+			}
 			if psAssignment.TopologyAssignment != nil && !psAssignment.HasUnhealthyNode(wl) {
 				// skip if already computed and doesn't need recomputing
 				// if it already has an assignment but needs recomputing due to a failed node
