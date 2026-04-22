@@ -27,8 +27,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/component-base/featuregate"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -4835,6 +4837,483 @@ func TestPriorityInfo(t *testing.T) {
 			if gotEff != tc.wantEffective || gotBase != tc.wantBase || gotBoost != tc.wantBoost {
 				t.Errorf("priorityInfo() = (%d, %d, %d), want (%d, %d, %d)",
 					gotEff, gotBase, gotBoost, tc.wantEffective, tc.wantBase, tc.wantBoost)
+			}
+		})
+	}
+}
+
+// TestIssuePreemptionsWithNotFoundTarget validates that a 404 NotFound error
+// during eviction is treated as a successful preemption and does not cancel
+// other parallel eviction goroutines.
+func TestIssuePreemptionsWithNotFoundTarget(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	rf := utiltestingapi.MakeResourceFlavor("default").Obj()
+	cq := utiltestingapi.MakeClusterQueue("standalone").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "4").
+				Obj(),
+		).ResourceGroup().
+		Preemption(kueue.ClusterQueuePreemption{
+			WithinClusterQueue: kueue.PreemptionPolicyLowerPriority,
+		}).
+		Obj()
+
+	// "ghost" is in the cache/snapshot but will return NotFound from the API.
+	// "valid" is a real workload that should be preempted normally.
+	// Both use 2 CPU in a 4 CPU queue, so incoming (4 CPU) must preempt both.
+	ghostWl := utiltestingapi.MakeWorkload("ghost", "").
+		UID("ghost-uid").
+		ResourceVersion("1").
+		Priority(-2).
+		Request(corev1.ResourceCPU, "2").
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("standalone").
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+					Assignment(corev1.ResourceCPU, "default", "2000m").
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+
+	validWl := utiltestingapi.MakeWorkload("valid", "").
+		UID("valid-uid").
+		ResourceVersion("1").
+		Priority(-1).
+		Request(corev1.ResourceCPU, "2").
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("standalone").
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+					Assignment(corev1.ResourceCPU, "default", "2000m").
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+
+	incoming := utiltestingapi.MakeWorkload("in", "").
+		UID("wl-in").
+		ResourceVersion("1").
+		Label(controllerconstants.JobUIDLabel, "job-in").Clone().
+		Priority(1).
+		Request(corev1.ResourceCPU, "4").
+		Obj()
+
+	assignment := singlePodSetAssignment(flavorassigner.ResourceAssignment{
+		corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+			Name: kueue.ResourceFlavorReference(rf.Name),
+			Mode: flavorassigner.Preempt,
+		},
+	})
+
+	for _, useMergePatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("WorkloadRequestUseMergePatch=%t", useMergePatch), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+			ctx, log := utiltesting.ContextWithLog(t)
+			store := preemptexpectations.New()
+
+			// Build a client that has only "valid" — "ghost" will get NotFound.
+			cl := utiltesting.NewClientBuilder().
+				WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*validWl.DeepCopy()}}).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge,
+				}).
+				Build()
+
+			cqCache := schdcache.New(cl)
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+			}
+
+			// Add both workloads to the cache (simulating ghost in cache).
+			cqCache.AddOrUpdateWorkload(log, ghostWl.DeepCopy())
+			cqCache.AddOrUpdateWorkload(log, validWl.DeepCopy())
+
+			broadcaster := record.NewBroadcaster()
+			scheme := runtime.NewScheme()
+			if err := kueue.AddToScheme(scheme); err != nil {
+				t.Fatalf("Failed adding kueue scheme: %v", err)
+			}
+			recorder := broadcaster.NewRecorder(scheme, corev1.EventSource{Component: constants.AdmissionName})
+			preemptor := New(cl, workload.Ordering{}, recorder, nil, false, clocktesting.NewFakeClock(now), nil, store, nil)
+
+			snapshot, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			wlInfo := workload.NewInfo(incoming)
+			wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
+			targets := preemptor.GetTargets(log, *wlInfo, assignment, snapshot)
+
+			if len(targets) != 2 {
+				t.Fatalf("Expected 2 preemption targets, got %d", len(targets))
+			}
+
+			preempted, failedPreemptions, issueErr := preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshot.ClusterQueue(wlInfo.ClusterQueue))
+
+			// NotFound should NOT propagate as an error.
+			if issueErr != nil {
+				t.Errorf("Expected no error from IssuePreemptions, got: %v", issueErr)
+			}
+			// Both should count as successfully preempted (ghost=NotFound treated as success, valid=evicted).
+			if preempted != 2 {
+				t.Errorf("Expected 2 preempted, got %d", preempted)
+			}
+			if failedPreemptions != 0 {
+				t.Errorf("Expected 0 failedPreemptions, got %d", failedPreemptions)
+			}
+		})
+	}
+}
+
+// TestGhostRemovedFromCacheAfterNotFound verifies that after IssuePreemptions
+// handles a NotFound, the ghost workload is removed from the scheduler cache
+// so it won't appear in subsequent snapshots.
+func TestGhostRemovedFromCacheAfterNotFound(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	rf := utiltestingapi.MakeResourceFlavor("default").Obj()
+	cq := utiltestingapi.MakeClusterQueue("standalone").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "6").
+				Obj(),
+		).ResourceGroup().
+		Preemption(kueue.ClusterQueuePreemption{
+			WithinClusterQueue: kueue.PreemptionPolicyLowerPriority,
+		}).
+		Obj()
+
+	ghostWl := utiltestingapi.MakeWorkload("ghost", "").
+		UID("ghost-uid").
+		ResourceVersion("1").
+		Priority(-1).
+		Request(corev1.ResourceCPU, "2").
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("standalone").
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+					Assignment(corev1.ResourceCPU, "default", "2000m").
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+
+	incoming := utiltestingapi.MakeWorkload("in", "").
+		UID("wl-in").
+		ResourceVersion("1").
+		Label(controllerconstants.JobUIDLabel, "job-in").Clone().
+		Priority(1).
+		Request(corev1.ResourceCPU, "2").
+		Obj()
+
+	assignment := singlePodSetAssignment(flavorassigner.ResourceAssignment{
+		corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+			Name: kueue.ResourceFlavorReference(rf.Name),
+			Mode: flavorassigner.Preempt,
+		},
+	})
+
+	for _, useMergePatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("WorkloadRequestUseMergePatch=%t", useMergePatch), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+			ctx, log := utiltesting.ContextWithLog(t)
+			store := preemptexpectations.New()
+
+			// Empty client — ghost is not in the API at all.
+			cl := utiltesting.NewClientBuilder().
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge,
+				}).
+				Build()
+
+			cqCache := schdcache.New(cl)
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+			}
+
+			// Add ghost to cache.
+			cqCache.AddOrUpdateWorkload(log, ghostWl.DeepCopy())
+
+			broadcaster := record.NewBroadcaster()
+			scheme := runtime.NewScheme()
+			if err := kueue.AddToScheme(scheme); err != nil {
+				t.Fatalf("Failed adding kueue scheme: %v", err)
+			}
+			recorder := broadcaster.NewRecorder(scheme, corev1.EventSource{Component: constants.AdmissionName})
+			preemptor := New(cl, workload.Ordering{}, recorder, nil, false, clocktesting.NewFakeClock(now), nil, store, nil)
+
+			snapshot, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			wlInfo := workload.NewInfo(incoming)
+			wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
+			targets := preemptor.GetTargets(log, *wlInfo, assignment, snapshot)
+
+			if len(targets) != 1 {
+				t.Fatalf("Expected 1 preemption target (ghost), got %d", len(targets))
+			}
+
+			preempted, _, issueErr := preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshot.ClusterQueue(wlInfo.ClusterQueue))
+			if issueErr != nil {
+				t.Fatalf("IssuePreemptions returned unexpected error: %v", issueErr)
+			}
+			if preempted != 1 {
+				t.Fatalf("Expected 1 preempted, got %d", preempted)
+			}
+
+			// Take a new snapshot — ghost should be gone.
+			snapshot2, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			cqSnap := snapshot2.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
+			if cqSnap == nil {
+				t.Fatal("ClusterQueue snapshot is nil")
+			}
+
+			ghostKey := workload.Key(ghostWl)
+			if _, found := cqSnap.Workloads[ghostKey]; found {
+				t.Errorf("Ghost workload %q should have been removed from cache but is still present in snapshot", ghostKey)
+			}
+		})
+	}
+}
+
+// TestIssuePreemptionsNonNotFoundErrorStillFails verifies that non-NotFound
+// errors (e.g. API server errors) are still propagated as failures.
+func TestIssuePreemptionsNonNotFoundErrorStillFails(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	rf := utiltestingapi.MakeResourceFlavor("default").Obj()
+	cq := utiltestingapi.MakeClusterQueue("standalone").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "6").
+				Obj(),
+		).ResourceGroup().
+		Preemption(kueue.ClusterQueuePreemption{
+			WithinClusterQueue: kueue.PreemptionPolicyLowerPriority,
+		}).
+		Obj()
+
+	targetWl := utiltestingapi.MakeWorkload("target", "").
+		UID("target-uid").
+		ResourceVersion("1").
+		Priority(-1).
+		Request(corev1.ResourceCPU, "2").
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("standalone").
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+					Assignment(corev1.ResourceCPU, "default", "2000m").
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+
+	incoming := utiltestingapi.MakeWorkload("in", "").
+		UID("wl-in").
+		ResourceVersion("1").
+		Label(controllerconstants.JobUIDLabel, "job-in").Clone().
+		Priority(1).
+		Request(corev1.ResourceCPU, "2").
+		Obj()
+
+	assignment := singlePodSetAssignment(flavorassigner.ResourceAssignment{
+		corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+			Name: kueue.ResourceFlavorReference(rf.Name),
+			Mode: flavorassigner.Preempt,
+		},
+	})
+
+	for _, useMergePatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("WorkloadRequestUseMergePatch=%t", useMergePatch), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+			ctx, log := utiltesting.ContextWithLog(t)
+			store := preemptexpectations.New()
+
+			// Interceptor that returns a server error on status patch.
+			cl := utiltesting.NewClientBuilder().
+				WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*targetWl.DeepCopy()}}).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						return apierrors.NewInternalError(fmt.Errorf("simulated server error"))
+					},
+				}).
+				Build()
+
+			cqCache := schdcache.New(cl)
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+			}
+
+			cqCache.AddOrUpdateWorkload(log, targetWl.DeepCopy())
+
+			broadcaster := record.NewBroadcaster()
+			scheme := runtime.NewScheme()
+			if err := kueue.AddToScheme(scheme); err != nil {
+				t.Fatalf("Failed adding kueue scheme: %v", err)
+			}
+			recorder := broadcaster.NewRecorder(scheme, corev1.EventSource{Component: constants.AdmissionName})
+			preemptor := New(cl, workload.Ordering{}, recorder, nil, false, clocktesting.NewFakeClock(now), nil, store, nil)
+
+			snapshot, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			wlInfo := workload.NewInfo(incoming)
+			wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
+			targets := preemptor.GetTargets(log, *wlInfo, assignment, snapshot)
+
+			if len(targets) != 1 {
+				t.Fatalf("Expected 1 preemption target, got %d", len(targets))
+			}
+
+			_, failedPreemptions, issueErr := preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshot.ClusterQueue(wlInfo.ClusterQueue))
+
+			// Non-NotFound error should be propagated.
+			if issueErr == nil {
+				t.Error("Expected an error from IssuePreemptions, got nil")
+			}
+			if failedPreemptions != 1 {
+				t.Errorf("Expected 1 failedPreemption, got %d", failedPreemptions)
+			}
+		})
+	}
+}
+
+// TestIssuePreemptionsNotFoundWithGetFailure verifies that when Evict returns
+// NotFound because the workload was deleted (Get inside Evict returns NotFound),
+// the ghost is cleaned from cache.
+func TestIssuePreemptionsNotFoundWithGetFailure(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	rf := utiltestingapi.MakeResourceFlavor("default").Obj()
+	cq := utiltestingapi.MakeClusterQueue("standalone").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "6").
+				Obj(),
+		).ResourceGroup().
+		Preemption(kueue.ClusterQueuePreemption{
+			WithinClusterQueue: kueue.PreemptionPolicyLowerPriority,
+		}).
+		Obj()
+
+	ghostWl := utiltestingapi.MakeWorkload("ghost", "ns").
+		UID("ghost-uid").
+		ResourceVersion("1").
+		Priority(-1).
+		Request(corev1.ResourceCPU, "2").
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("standalone").
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
+					Assignment(corev1.ResourceCPU, "default", "2000m").
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+
+	incoming := utiltestingapi.MakeWorkload("in", "ns").
+		UID("wl-in").
+		ResourceVersion("1").
+		Label(controllerconstants.JobUIDLabel, "job-in").Clone().
+		Priority(1).
+		Request(corev1.ResourceCPU, "2").
+		Obj()
+
+	assignment := singlePodSetAssignment(flavorassigner.ResourceAssignment{
+		corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+			Name: kueue.ResourceFlavorReference(rf.Name),
+			Mode: flavorassigner.Preempt,
+		},
+	})
+
+	for _, useMergePatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("WorkloadRequestUseMergePatch=%t", useMergePatch), func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, useMergePatch)
+			ctx, log := utiltesting.ContextWithLog(t)
+			store := preemptexpectations.New()
+
+			// Intercept Get to return NotFound for the ghost workload.
+			cl := utiltesting.NewClientBuilder().
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*kueue.Workload); ok && key.Name == "ghost" {
+							return apierrors.NewNotFound(
+								schema.GroupResource{Group: "kueue.x-k8s.io", Resource: "workloads"},
+								"ghost",
+							)
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+					SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge,
+				}).
+				Build()
+
+			cqCache := schdcache.New(cl)
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+				t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+			}
+
+			cqCache.AddOrUpdateWorkload(log, ghostWl.DeepCopy())
+
+			broadcaster := record.NewBroadcaster()
+			scheme := runtime.NewScheme()
+			if err := kueue.AddToScheme(scheme); err != nil {
+				t.Fatalf("Failed adding kueue scheme: %v", err)
+			}
+			recorder := broadcaster.NewRecorder(scheme, corev1.EventSource{Component: constants.AdmissionName})
+			preemptor := New(cl, workload.Ordering{}, recorder, nil, false, clocktesting.NewFakeClock(now), nil, store, nil)
+
+			snapshot, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			wlInfo := workload.NewInfo(incoming)
+			wlInfo.ClusterQueue = kueue.ClusterQueueReference(cq.Name)
+			targets := preemptor.GetTargets(log, *wlInfo, assignment, snapshot)
+
+			if len(targets) != 1 {
+				t.Fatalf("Expected 1 preemption target (ghost), got %d", len(targets))
+			}
+
+			preempted, failedPreemptions, issueErr := preemptor.IssuePreemptions(ctx, cqCache, wlInfo, targets, snapshot.ClusterQueue(wlInfo.ClusterQueue))
+
+			if issueErr != nil {
+				t.Errorf("Expected no error, got: %v", issueErr)
+			}
+			if preempted != 1 {
+				t.Errorf("Expected 1 preempted (ghost treated as success), got %d", preempted)
+			}
+			if failedPreemptions != 0 {
+				t.Errorf("Expected 0 failedPreemptions, got %d", failedPreemptions)
+			}
+
+			// Ghost should be gone from cache.
+			snapshot2, err := cqCache.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error while building snapshot: %v", err)
+			}
+
+			cqSnap := snapshot2.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
+			ghostKey := workload.Key(ghostWl)
+			if _, found := cqSnap.Workloads[ghostKey]; found {
+				t.Errorf("Ghost workload %q should have been removed from cache", ghostKey)
 			}
 		})
 	}
