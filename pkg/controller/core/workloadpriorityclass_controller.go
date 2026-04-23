@@ -119,11 +119,18 @@ func (r *WorkloadPriorityClassReconciler) Reconcile(ctx context.Context, req ctr
 }
 
 func (r *WorkloadPriorityClassReconciler) Create(e event.TypedCreateEvent[*kueue.WorkloadPriorityClass]) bool {
+	// Skip initial LIST on startup — the WPC hasn't changed, so there's
+	// nothing to reconcile. This prevents overwriting workload priorities
+	// that were intentionally set by another system.
+	if e.IsInInitialList {
+		return false
+	}
+
 	log := r.logger().WithValues("workloadPriorityClass", klog.KObj(e.Object))
 	log.V(2).Info("WorkloadPriorityClass create event")
 
-	// Covering the case when the WorkloadPriorityClass was re-created with a different priority,
-	// but the Workload is still referencing it.
+	// Covering the case when the WorkloadPriorityClass was re-created with a
+	// different priority, but the Workload is still referencing it.
 	return true
 }
 

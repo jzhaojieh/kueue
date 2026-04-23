@@ -47,6 +47,11 @@ func TestWorkloadPriorityClassPredicates(t *testing.T) {
 			newWPC:    utiltestingapi.MakeWorkloadPriorityClass("test").PriorityValue(100).Obj(),
 			want:      true,
 		},
+		"create event from initial list should not trigger reconcile": {
+			eventType: "create-initial-list",
+			newWPC:    utiltestingapi.MakeWorkloadPriorityClass("test").PriorityValue(100).Obj(),
+			want:      false,
+		},
 		"delete event should not trigger reconcile": {
 			eventType: "delete",
 			oldWPC:    utiltestingapi.MakeWorkloadPriorityClass("test").PriorityValue(100).Obj(),
@@ -79,6 +84,8 @@ func TestWorkloadPriorityClassPredicates(t *testing.T) {
 			switch tc.eventType {
 			case "create":
 				got = reconciler.Create(event.TypedCreateEvent[*kueue.WorkloadPriorityClass]{Object: tc.newWPC})
+			case "create-initial-list":
+				got = reconciler.Create(event.TypedCreateEvent[*kueue.WorkloadPriorityClass]{Object: tc.newWPC, IsInInitialList: true})
 			case "delete":
 				got = reconciler.Delete(event.TypedDeleteEvent[*kueue.WorkloadPriorityClass]{Object: tc.oldWPC})
 			case "update":
