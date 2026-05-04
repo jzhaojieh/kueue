@@ -115,8 +115,8 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 }
 
 func (r *PodReconciler) setDefault(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	// If queue label already exist nothing to update.
-	if _, ok := pod.Labels[controllerconstants.QueueLabel]; ok {
+	// If pod-group-name label already exists, pod is fully configured.
+	if _, ok := pod.Labels[podconstants.GroupNameLabel]; ok {
 		return false, nil
 	}
 
